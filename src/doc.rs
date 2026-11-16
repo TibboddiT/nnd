@@ -247,6 +247,7 @@ Debugging tips:
  * Conditional breakpoints are not super fast: a few thousand evaluations per second.
  * Inside libraries that were dlopen()ed at runtime, breakpoints get disabled on program restart. Manually disable-enable the breakpoint after the dlopen() to reactivate it.
  * The 'disassembly' window prefers functions from .symtab or debug info, but can fall back to memory disassembly. Press 'g' and enter a single raw address to open memory around that address if no function is found; unresolved stack-frame IPs can also open memory tabs automatically.
+    Memory tabs are reused for nearby addresses and grow when navigating towards their edges. Earlier instructions are added only when their alignment is unambiguous. Raw instruction breakpoints can be opened from the breakpoints window.
     Explicit address ranges are not supported yet.
  * The debugger gets noticeably slow when the program has > 1K threads, and unusably slow with 20K threads. Part of it is inevitable syscalls
    (to start/stop all n threads we have to do n*const syscalls, then wait for n notifications - that takes a while), but there's a lot of room for improvement anyway

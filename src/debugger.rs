@@ -1329,7 +1329,7 @@ impl Debugger {
         Ok((range, buf))
     }
 
-    pub fn find_readable_code_range_around_addr(&self, addr: usize, before: usize, after: usize) -> Result<Range<usize>> {
+    pub fn read_code_around_addr(&self, addr: usize, before: usize, after: usize) -> Result<(Range<usize>, Vec<u8>)> {
         let map = match self.info.maps.addr_to_map(addr) {
             Some(x) => x,
             None => return err!(ProcessState, "address not mapped: 0x{:x}", addr),
@@ -1346,32 +1346,51 @@ impl Debugger {
         let required_page_start = (addr / page_size) * page_size;
         let required_start = required_page_start.max(start);
         let required_end = required_page_start.saturating_add(page_size).min(end);
-        let mut required = vec![0; required_end - required_start];
-        self.memory.read(required_start, &mut required)?;
+        let mut code = vec![0; end - start];
+        self.memory.read(required_start, &mut code[required_start - start..required_end - start])?;
 
+        // Most ranges are fully readable. Batch those reads, falling back to pages
+        // only when a batch straddles an unreadable area.
+        const BLOCK_SIZE: usize = 64 * 1024;
         let mut cur = required_start;
-        while cur > start {
-            let block_start = cur.saturating_sub(page_size).max(start);
-            let mut buf = vec![0; cur - block_start];
-            if self.memory.read(block_start, &mut buf).is_err() {
-                break;
+        'before: while cur > start {
+            let block_start = cur.saturating_sub(BLOCK_SIZE).max(start);
+            if self.memory.read(block_start, &mut code[block_start - start..cur - start]).is_ok() {
+                cur = block_start;
+                continue;
             }
-            cur = block_start;
+            while cur > block_start {
+                let page_start = cur.saturating_sub(page_size).max(block_start);
+                if self.memory.read(page_start, &mut code[page_start - start..cur - start]).is_err() {
+                    break 'before;
+                }
+                cur = page_start;
+            }
         }
         let actual_start = cur;
 
         cur = required_end;
-        while cur < end {
-            let block_end = cur.saturating_add(page_size).min(end);
-            let mut buf = vec![0; block_end - cur];
-            if self.memory.read(cur, &mut buf).is_err() {
-                break;
+        'after: while cur < end {
+            let block_end = cur.saturating_add(BLOCK_SIZE).min(end);
+            if self.memory.read(cur, &mut code[cur - start..block_end - start]).is_ok() {
+                cur = block_end;
+                continue;
             }
-            cur = block_end;
+            while cur < block_end {
+                let page_end = cur.saturating_add(page_size).min(block_end);
+                if self.memory.read(cur, &mut code[cur - start..page_end - start]).is_err() {
+                    break 'after;
+                }
+                cur = page_end;
+            }
         }
         let actual_end = cur;
 
-        Ok(actual_start..actual_end)
+        code.truncate(actual_end - start);
+        code.drain(..actual_start - start);
+        let range = actual_start..actual_end;
+        self.fixup_code_range_bytes(range.clone(), &mut code);
+        Ok((range, code))
     }
 
     fn read_code_range_into(&self, range: Range<usize>, buf: &mut Vec<u8>) -> Result<()> {

@@ -88,13 +88,16 @@ enum DisassemblyOpenRequest {
     },
     Memory {
         range: Range<usize>,
+        code: Option<Vec<u8>>,
         requested_addr: usize,
         scroll_addr: usize,
         ip_anchor: Option<usize>,
+        revalidate: bool, // Automatic IP navigation may realign an existing memory tab.
         cascade: bool,
     },
     AutoMemory {
-        ip: usize,
+        ip: usize, // Trusted instruction boundary (RIP or a caller's return address).
+        addr: usize, // Address to select; may lie inside the caller's call instruction.
         cascade: bool,
     },
 }
@@ -119,7 +122,7 @@ impl DisassemblyOpenRequest {
         match self {
             Self::Function {static_pseudo_addr, subfunction_level, ..} => DisassemblyScrollTarget::Function {static_pseudo_addr: *static_pseudo_addr, subfunction_level: *subfunction_level},
             Self::Memory {scroll_addr, ..} => DisassemblyScrollTarget::Memory {addr: *scroll_addr},
-            Self::AutoMemory {ip, ..} => DisassemblyScrollTarget::Memory {addr: *ip},
+            Self::AutoMemory {addr, ..} => DisassemblyScrollTarget::Memory {addr: *addr},
         }
     }
 }
@@ -1882,6 +1885,8 @@ struct DisassemblyTab {
     //  * locator is None, memory_range is None, error is Some - generic error tab.
     locator: Option<FunctionLocator>,
     memory_range: Option<Range<usize>>,
+    memory_code: Option<Vec<u8>>, // Pending snapshot, shared by alignment and rendering.
+    memory_scroll: Option<usize>, // Preserve cursor address and viewport when extending the range.
     requested_addr: usize,
     error: Option<Error>,
     cached_function_idx: Option<(/*binary_id*/ usize, /*function_idx*/ usize)>,
@@ -1900,18 +1905,36 @@ enum DisassemblyCacheKey {
     Memory(/*start*/ usize, /*end*/ usize, /*requested_addr*/ usize),
 }
 
+struct CachedDisassembly {
+    disas: Disassembly,
+    code: Option<Vec<u8>>, // Memory snapshot; None for functions and failed reads.
+    fresh: bool, // Memory was checked at the current process stop.
+    last_used: usize,
+}
+
+impl CachedDisassembly {
+    fn memory_usage(&self) -> usize {
+        self.code.as_ref().map_or(0, |c| c.capacity()) +
+            self.disas.lines.capacity() * mem::size_of::<DisassemblyLineInfo>() +
+            self.disas.text.chars.capacity() +
+            self.disas.text.lines.capacity() * mem::size_of::<usize>() +
+            self.disas.text.spans.capacity() * mem::size_of::<(usize, Style)>()
+    }
+}
+
 struct DisassemblyWindow {
     tabs: Vec<DisassemblyTab>,
-    cache: HashMap<DisassemblyCacheKey, Disassembly>,
+    cache: HashMap<DisassemblyCacheKey, CachedDisassembly>,
     tabs_state: TabsState,
     search_dialog: Option<SearchDialog>,
     go_to_address_bar: SearchBar,
     go_to_address_error: Option<Error>,
     source_scrolled_to: Option<(/*binary_id*/ usize, /*function_idx*/ usize, /*disas_line*/ usize, /*selected_subfunction_level*/ u16)>,
-    failed_memory_ranges: Vec<Range<usize>>,
+    failed_memory_ranges: Vec<(Range<usize>, Error)>,
+    memory_stop: Option<(/*start_count*/ usize, /*tid*/ pid_t, /*stop_count*/ usize)>,
 }
 
-impl Default for DisassemblyWindow { fn default() -> Self { Self {tabs: Vec::new(), cache: HashMap::new(), tabs_state: TabsState::default(), search_dialog: None, go_to_address_bar: SearchBar::default(), go_to_address_error: None, source_scrolled_to: None, failed_memory_ranges: Vec::new()} } }
+impl Default for DisassemblyWindow { fn default() -> Self { Self {tabs: Vec::new(), cache: HashMap::new(), tabs_state: TabsState::default(), search_dialog: None, go_to_address_bar: SearchBar::default(), go_to_address_error: None, source_scrolled_to: None, failed_memory_ranges: Vec::new(), memory_stop: None} } }
 
 impl DisassemblyWindow {
     fn open_disassembly(&mut self, request: Result<DisassemblyOpenRequest>, debugger: &Debugger) -> Result<()> {
@@ -1927,29 +1950,52 @@ impl DisassemblyWindow {
         };
         let (target_binary_id, target_function_idx) = match request {
             DisassemblyOpenRequest::Function {binary_id, function_idx, ..} => (binary_id, function_idx),
-            DisassemblyOpenRequest::Memory {range, requested_addr, ip_anchor, ..} => {
+            DisassemblyOpenRequest::Memory {mut range, mut code, requested_addr, ip_anchor, revalidate, ..} => {
                 for i in 0..self.tabs.len() {
                     let tab_requested_addr = self.tabs[i].requested_addr;
-                    if self.tabs[i].memory_range.as_ref() == Some(&range) && tab_requested_addr == requested_addr {
-                        if let Some(ip) = ip_anchor.filter(|ip| range.start <= *ip && *ip < range.end) {
-                            if Self::cached_memory_disassembly_has_instruction_start(&self.cache, &range, tab_requested_addr, ip) == Some(false) {
-                                self.cache.remove(&DisassemblyCacheKey::Memory(range.start, range.end, tab_requested_addr));
+                    if self.tabs[i].memory_range.as_ref().is_some_and(|r| r.start < range.end && range.start < r.end) {
+                        let old_range = self.tabs[i].memory_range.as_ref().unwrap();
+                        let compatible = self.cache.get(&DisassemblyCacheKey::Memory(old_range.start, old_range.end, tab_requested_addr))
+                            .is_some_and(|d| d.fresh && d.disas.static_addr_to_line(range.start).is_some() && ip_anchor.map_or(true, |ip| d.disas.static_addr_to_line(ip).is_some()));
+                        // A new, incompatible location must not replace a pinned tab.
+                        // Reopening the same location and automatic IP realignment are different.
+                        if !compatible && requested_addr != tab_requested_addr && !(revalidate && old_range.contains(&requested_addr)) {
+                            continue;
+                        }
+                        if compatible && old_range.contains(&requested_addr) {
+                            self.tabs_state.select(i);
+                            return Ok(());
+                        }
+                        if compatible && old_range.start < range.start && code.is_some() {
+                            if let Ok((prefix_range, mut prefix)) = debugger.read_code_range(old_range.start..range.start) {
+                                if prefix_range.end == range.start {
+                                    prefix.extend_from_slice(code.as_ref().unwrap());
+                                    code = Some(prefix);
+                                    range.start = old_range.start;
+                                }
                             }
                         }
+                        self.cache.remove(&DisassemblyCacheKey::Memory(old_range.start, old_range.end, tab_requested_addr));
+                        self.tabs[i].memory_range = Some(range.clone());
+                        self.tabs[i].memory_code = code;
+                        self.tabs[i].requested_addr = requested_addr;
+                        self.tabs[i].title = format!("mem:{:x}", requested_addr);
+                        self.tabs[i].memory_scroll = None;
+                        self.cache.remove(&DisassemblyCacheKey::Memory(range.start, range.end, requested_addr));
                         self.tabs_state.select(i);
                         return Ok(());
                     }
                 }
                 self.tabs.push(DisassemblyTab {
-                    identity: random(), memory_range: Some(range.clone()), requested_addr,
+                    identity: random(), memory_range: Some(range.clone()), memory_code: code, requested_addr,
                     title: format!("mem:{:x}", requested_addr), ephemeral: true,
                     ..Default::default()
                 });
                 self.tabs_state.select(self.tabs.len() - 1);
                 return Ok(());
             }
-            DisassemblyOpenRequest::AutoMemory {ip, ..} => {
-                if let Err(e) = self.open_auto_memory(ip, debugger) {
+            DisassemblyOpenRequest::AutoMemory {ip, addr, ..} => {
+                if let Err(e) = self.open_auto_memory(ip, addr, debugger) {
                     self.tabs.push(DisassemblyTab {identity: random(), error: Some(e), title: "[memory]".to_string(), ephemeral: true, ..Default::default()});
                     self.tabs_state.select(self.tabs.len() - 1);
                 }
@@ -1982,40 +2028,22 @@ impl DisassemblyWindow {
         Ok(())
     }
 
-    fn failed_memory_range_contains(&self, addr: usize) -> bool {
-        let i = self.failed_memory_ranges.partition_point(|r| r.end <= addr);
-        i < self.failed_memory_ranges.len() && self.failed_memory_ranges[i].start <= addr
-    }
-
-    fn remember_failed_memory_range(&mut self, mut range: Range<usize>) {
-        if range.is_empty() {
-            return;
-        }
-        let i = self.failed_memory_ranges.partition_point(|r| r.end < range.start);
-        while i < self.failed_memory_ranges.len() && self.failed_memory_ranges[i].start <= range.end {
-            let old = self.failed_memory_ranges.remove(i);
-            range.start = range.start.min(old.start);
-            range.end = range.end.max(old.end);
-        }
-        self.failed_memory_ranges.insert(i, range);
-        if self.failed_memory_ranges.len() > 1000 {
-            self.failed_memory_ranges.drain(0..500);
-        }
-    }
-
-    fn cached_memory_disassembly_has_instruction_start(cache: &HashMap<DisassemblyCacheKey, Disassembly>, range: &Range<usize>, requested_addr: usize, ip: usize) -> Option<bool> {
+    fn cached_memory_disassembly_has_instruction_start(cache: &HashMap<DisassemblyCacheKey, CachedDisassembly>, range: &Range<usize>, requested_addr: usize, ip: usize) -> Option<bool> {
         if !(range.start <= ip && ip < range.end) {
             return Some(true);
         }
-        cache.get(&DisassemblyCacheKey::Memory(range.start, range.end, requested_addr)).map(|disas| disas.static_addr_to_line(ip).is_some())
+        cache.get(&DisassemblyCacheKey::Memory(range.start, range.end, requested_addr)).filter(|d| d.fresh).map(|d| d.disas.static_addr_to_line(ip).is_some())
     }
 
-    fn open_auto_memory(&mut self, ip: usize, debugger: &Debugger) -> Result<()> {
+    fn open_auto_memory(&mut self, ip: usize, addr: usize, debugger: &Debugger) -> Result<()> {
         const AUTO_MEMORY_DISASSEMBLY_BEFORE: usize = 16 * 1024;
         const AUTO_MEMORY_DISASSEMBLY_AFTER: usize = 16 * 1024;
         const AUTO_MEMORY_ALIGNMENT_PROBE_LEN: usize = 1024;
         const AUTO_MEMORY_ALIGNMENT_STEP: usize = 4 * 1024;
 
+        if let Some((_, error)) = self.failed_memory_ranges.iter().find(|(r, _)| r.contains(&ip)) {
+            return Err(error.clone());
+        }
         for i in 0..self.tabs.len() {
             if let Some(range) = self.tabs[i].memory_range.clone().filter(|r| r.start <= ip && ip < r.end) {
                 let requested_addr = self.tabs[i].requested_addr;
@@ -2026,32 +2054,36 @@ impl DisassemblyWindow {
                     }
                     Some(false) => { self.cache.remove(&DisassemblyCacheKey::Memory(range.start, range.end, requested_addr)); }
                     None => {
-                        self.tabs_state.select(i);
-                        return Ok(());
+                        if let Ok((actual_range, code)) = debugger.read_code_range(range.clone()) {
+                            if let Some(cached) = self.cache.get_mut(&DisassemblyCacheKey::Memory(range.start, range.end, requested_addr)) {
+                                if cached.code.as_ref() == Some(&code) && cached.disas.error.is_none() {
+                                    cached.fresh = true;
+                                    if cached.disas.static_addr_to_line(ip).is_some() {
+                                        self.tabs_state.select(i);
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                            if instruction_stream_has_boundary(&code, actual_range.start, ip) {
+                                self.tabs[i].memory_range = Some(actual_range);
+                                self.tabs[i].memory_code = Some(code);
+                                self.tabs_state.select(i);
+                                return Ok(());
+                            }
+                        }
                     }
                 }
             }
         }
-        if self.failed_memory_range_contains(ip) {
-            return err!(ProcessState, "memory disassembly previously failed around 0x{:x}", ip);
-        }
-
-        let requested_range = ip.saturating_sub(AUTO_MEMORY_DISASSEMBLY_BEFORE)..ip.saturating_add(AUTO_MEMORY_DISASSEMBLY_AFTER);
-        let mut range = match debugger.find_readable_code_range_around_addr(ip, AUTO_MEMORY_DISASSEMBLY_BEFORE, AUTO_MEMORY_DISASSEMBLY_AFTER) {
+        let (mut range, mut code) = match debugger.read_code_around_addr(ip, AUTO_MEMORY_DISASSEMBLY_BEFORE, AUTO_MEMORY_DISASSEMBLY_AFTER) {
             Ok(x) => x,
             Err(e) => {
-                self.remember_failed_memory_range(requested_range);
-                return Err(e);
-            }
-        };
-        if !(range.start <= ip && ip < range.end) {
-            self.remember_failed_memory_range(range);
-            return err!(ProcessState, "memory read did not cover instruction pointer 0x{:x}", ip);
-        }
-        let (_, code) = match debugger.read_code_range(range.clone()) {
-            Ok(x) => x,
-            Err(e) => {
-                self.remember_failed_memory_range(range);
+                let page_size = sysconf_PAGE_SIZE();
+                let start = ip / page_size * page_size;
+                if self.failed_memory_ranges.len() >= 1000 {
+                    self.failed_memory_ranges.drain(0..500);
+                }
+                self.failed_memory_ranges.push((start..start.saturating_add(page_size), e.clone()));
                 return Err(e);
             }
         };
@@ -2066,17 +2098,19 @@ impl DisassemblyWindow {
             probe_start = probe_start.saturating_add(AUTO_MEMORY_ALIGNMENT_STEP);
         }
 
+        // Caller-frame pseudo addresses lie inside the call, not at a boundary.
+        // Try the immediately preceding stream too, anchored at the return address.
+        if chosen_start == ip && addr < ip {
+            if let Some(start) = find_unique_instruction_start_before_ip(&code, range.start, ip.saturating_sub(MAX_X86_INSTRUCTION_BYTES).max(range.start), MAX_X86_INSTRUCTION_BYTES - 1, ip) {
+                chosen_start = start;
+            }
+        }
         if chosen_start > range.start {
+            code.drain(..chosen_start - range.start);
             range.start = chosen_start;
         }
 
-        self.tabs.push(DisassemblyTab {
-            identity: random(), memory_range: Some(range.clone()), requested_addr: ip,
-            title: format!("mem:{:x}", ip), ephemeral: true,
-            ..Default::default()
-        });
-        self.tabs_state.select(self.tabs.len() - 1);
-        Ok(())
+        self.open_disassembly(Ok(DisassemblyOpenRequest::Memory {range, code: Some(code), requested_addr: ip, scroll_addr: addr, ip_anchor: Some(ip), revalidate: true, cascade: false}), debugger)
     }
 
     fn find_manual_memory_target(addr: usize, debugger: &Debugger, ip_anchor: Option<usize>) -> Result<DisassemblyOpenRequest> {
@@ -2084,16 +2118,78 @@ impl DisassemblyWindow {
         const MANUAL_MEMORY_DISASSEMBLY_AFTER: usize = 64 * 1024;
         const MANUAL_MEMORY_ALIGNMENT_PROBE_LEN: usize = 1024;
 
-        let mut range = debugger.find_readable_code_range_around_addr(addr, MANUAL_MEMORY_DISASSEMBLY_BEFORE, MANUAL_MEMORY_DISASSEMBLY_AFTER)?;
-        let (_, code) = debugger.read_code_range(range.clone())?;
+        let (mut range, mut code) = debugger.read_code_around_addr(addr, MANUAL_MEMORY_DISASSEMBLY_BEFORE, MANUAL_MEMORY_DISASSEMBLY_AFTER)?;
         let probe_start = addr.saturating_sub(MANUAL_MEMORY_DISASSEMBLY_BEFORE).max(range.start);
         let first_candidate_start = addr.saturating_sub(MAX_X86_INSTRUCTION_BYTES - 1).max(probe_start);
         let ip_anchor = ip_anchor.filter(|ip| first_candidate_start <= *ip && *ip < range.end);
         let chosen_start = find_best_instruction_start_before_addr(&code, range.start, probe_start, MANUAL_MEMORY_ALIGNMENT_PROBE_LEN, addr, ip_anchor).unwrap_or(addr);
         if chosen_start > range.start {
+            code.drain(..chosen_start - range.start);
             range.start = chosen_start;
         }
-        Ok(DisassemblyOpenRequest::Memory {range, requested_addr: addr, scroll_addr: addr, ip_anchor, cascade: true})
+        Ok(DisassemblyOpenRequest::Memory {range, code: Some(code), requested_addr: addr, scroll_addr: addr, ip_anchor, revalidate: false, cascade: true})
+    }
+
+    fn find_cached_memory_target(&self, addr: usize, ip_anchor: Option<usize>) -> Option<DisassemblyOpenRequest> {
+        for tab in &self.tabs {
+            let Some(range) = tab.memory_range.as_ref().filter(|r| r.contains(&addr)) else {continue};
+            let Some(cached) = self.cache.get(&DisassemblyCacheKey::Memory(range.start, range.end, tab.requested_addr)) else {continue};
+            // The saved range can be larger than the readable snapshot after a mapping shrank.
+            if !cached.fresh || cached.disas.error.is_some() || cached.code.as_ref().map_or(true, |c| addr - range.start >= c.len()) {
+                continue;
+            }
+            let ip_anchor = ip_anchor.filter(|ip| range.contains(ip));
+            if !cached.disas.static_pseudo_addr_to_line(addr).1 || ip_anchor.is_some_and(|ip| cached.disas.static_addr_to_line(ip).is_none()) {
+                continue;
+            }
+            return Some(DisassemblyOpenRequest::Memory {range: range.clone(), code: None, requested_addr: tab.requested_addr, scroll_addr: addr, ip_anchor, revalidate: false, cascade: true});
+        }
+        None
+    }
+
+    fn extend_memory_tab(&mut self, idx: usize, backwards: bool, forwards: bool, debugger: &Debugger, palette: &Palette, frame_idx: usize) -> bool {
+        let tab = &mut self.tabs[idx];
+        let range = tab.memory_range.clone().unwrap();
+        let key = DisassemblyCacheKey::Memory(range.start, range.end, tab.requested_addr);
+        if forwards {
+            // Stay within this mapping, just like the initial read.
+            let can_extend = debugger.info.maps.addr_to_map(range.start).is_some_and(|map| range.end < map.start.saturating_add(map.len));
+            let cached = self.cache.get(&key);
+            if can_extend && range.len() < 100_000_000 && cached.is_some_and(|c| c.fresh && c.disas.error.is_none() && !c.disas.lines.is_empty() && c.code.as_ref().is_some_and(|b| b.len() == range.len())) {
+                if let Ok((added_range, added_code)) = debugger.read_code_around_addr(range.end, 0, (100_000_000 - range.len()).min(16 * 1024)) {
+                    let expanded = range.start..added_range.end;
+                    let mut cached = self.cache.remove(&key).unwrap();
+                    let code = cached.code.as_mut().unwrap();
+                    code.extend_from_slice(&added_code);
+                    cached.disas.extend_memory(expanded.clone(), range.end, code, palette);
+                    cached.last_used = frame_idx;
+                    self.cache.insert(DisassemblyCacheKey::Memory(expanded.start, expanded.end, tab.requested_addr), cached);
+                    tab.memory_range = Some(expanded);
+                    return true;
+                }
+            }
+        }
+        if backwards {
+            let can_extend = debugger.info.maps.addr_to_map(range.start).is_some_and(|map| range.start > map.start);
+            if let Some(old_code) = self.cache.get(&key).filter(|c| c.fresh).and_then(|c| c.code.as_ref()).filter(|c| can_extend && c.len() == range.len()) {
+                if let Ok((prefix, mut code)) = debugger.read_code_around_addr(range.start - 1, 4095, 1) {
+                    let prefix_len = code.len();
+                    code.extend_from_slice(&old_code[..old_code.len().min(MAX_X86_INSTRUCTION_BYTES)]);
+                    let start = find_unique_instruction_start_before_ip(&code, prefix.start, prefix.start, 4096, range.start).unwrap_or(range.start);
+                    if start < range.start && range.end - start <= 100_000_000 {
+                        code.truncate(prefix_len);
+                        code.drain(..start - prefix.start);
+                        code.extend_from_slice(old_code);
+                        self.cache.remove(&key);
+                        self.cache.remove(&DisassemblyCacheKey::Memory(start, range.end, tab.requested_addr));
+                        tab.memory_range = Some(start..range.end);
+                        tab.memory_code = Some(code);
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 
     fn find_address(&self, mut query: &str, state: &UIState, debugger: &Debugger) -> Result<DisassemblyOpenRequest> {
@@ -2154,6 +2250,9 @@ impl DisassemblyWindow {
                 Err(function_err) if function_err.is_loading() => Err(function_err),
                 Err(function_err) => {
                     let ip_anchor = debugger.threads.get(&state.selected_thread).and_then(|thread| thread.info.regs.get_option(RegisterIdx::Rip)).map(|(ip, _)| ip as usize);
+                    if let Some(target) = self.find_cached_memory_target(addr, ip_anchor) {
+                        return Ok(target);
+                    }
                     match Self::find_manual_memory_target(addr, debugger, ip_anchor) {
                         Ok(target) => Ok(target),
                         Err(memory_err) => Err(if function_err.is_no_function() || function_err.is_missing_symbols() {memory_err} else {function_err}),
@@ -2245,63 +2344,53 @@ impl DisassemblyWindow {
         Some((binary, function_idx))
     }
 
-    fn find_or_disassemble_function<'a>(cache: &'a mut HashMap<DisassemblyCacheKey, Disassembly>, binary: &Binary, function_idx: usize, palette: &Palette) -> &'a Disassembly {
+    fn find_or_disassemble_function<'a>(cache: &'a mut HashMap<DisassemblyCacheKey, CachedDisassembly>, binary: &Binary, function_idx: usize, palette: &Palette) -> &'a Disassembly {
         let indent_width = str_width(&palette.tree_indent.0);
         let e = cache.entry(DisassemblyCacheKey::Function(binary.id, function_idx));
         match e {
-            Entry::Occupied(o) if o.get().indent_width == indent_width => o.into_mut(),
+            Entry::Occupied(o) if o.get().disas.indent_width == indent_width => &o.into_mut().disas,
             _ => {
-                // Would be nice to also support disassembling arbitrary memory, regardless of functions or binaries. E.g. for JIT-generated code.
                 let d = match Self::disassemble_function(binary, function_idx, palette) {
                     Ok(d) => d,
                     Err(e) => Disassembly::new().with_error(e, palette),
                 };
+                let d = CachedDisassembly {disas: d, code: None, fresh: true, last_used: 0};
                 match e {
                     Entry::Occupied(mut o) => {
                         *o.get_mut() = d;
-                        o.into_mut()
+                        &o.into_mut().disas
                     }
-                    Entry::Vacant(v) => v.insert(d),
+                    Entry::Vacant(v) => &v.insert(d).disas,
                 }
             }
         }
     }
 
-    fn find_or_disassemble_memory<'a>(cache: &'a mut HashMap<DisassemblyCacheKey, Disassembly>, debugger: &Debugger, range: Range<usize>, requested_addr: usize, palette: &Palette) -> &'a Disassembly {
+    fn find_or_disassemble_memory<'a>(cache: &'a mut HashMap<DisassemblyCacheKey, CachedDisassembly>, debugger: &Debugger, range: Range<usize>, code: Option<Vec<u8>>, requested_addr: usize, palette: &Palette, frame_idx: usize) -> &'a CachedDisassembly {
         let indent_width = str_width(&palette.tree_indent.0);
         let e = cache.entry(DisassemblyCacheKey::Memory(range.start, range.end, requested_addr));
-        match e {
-            Entry::Occupied(o) if o.get().indent_width == indent_width => o.into_mut(),
-            _ => {
-                let d = match debugger.read_code_range(range.clone()) {
-                    Ok((actual_range, code)) => {
-                        let mut prelude = StyledText::default();
-                        styled_writeln!(prelude, palette.default_dim, "memory range: 0x{:x}-0x{:x}", actual_range.start, actual_range.end);
-                        styled_writeln!(prelude, palette.default_dim, "requested address: 0x{:x}", requested_addr);
-                        if let Some(map) = debugger.info.maps.addr_to_map(actual_range.start) {
-                            let path = map.path.as_deref().unwrap_or("[anonymous]");
-                            styled_writeln!(prelude, palette.default_dim, "mapping: 0x{:x}-0x{:x} {}{}{} {}", map.start, map.start + map.len,
-                                if map.perms.contains(MemMapPermissions::READ) {"r"} else {"-"},
-                                if map.perms.contains(MemMapPermissions::WRITE) {"w"} else {"-"},
-                                if map.perms.contains(MemMapPermissions::EXECUTE) {"x"} else {"-"}, path);
-                        }
-                        prelude.close_line();
-                        disassemble_memory(actual_range, &code, prelude, palette)
-                    }
-                    Err(e) => Disassembly::new().with_error(e, palette),
-                };
-                match e {
-                    Entry::Occupied(mut o) => {
-                        *o.get_mut() = d;
-                        o.into_mut()
-                    }
-                    Entry::Vacant(v) => v.insert(d),
+        let cached = e.or_insert_with(|| CachedDisassembly {disas: Disassembly::new(), code: None, fresh: false, last_used: frame_idx});
+        cached.last_used = frame_idx;
+        if cached.fresh && code.is_none() && cached.disas.indent_width == indent_width {
+            return cached;
+        }
+        let read = code.map(|code| Ok((range.clone(), code))).unwrap_or_else(|| debugger.read_code_range(range));
+        match read {
+            Ok((actual_range, code)) => {
+                if cached.code.as_ref() != Some(&code) || cached.disas.indent_width != indent_width || cached.disas.error.is_some() {
+                    cached.disas = disassemble_memory(actual_range, &code, StyledText::default(), palette);
+                    cached.code = Some(code);
                 }
             }
+            Err(e) => {
+                cached.disas = Disassembly::new().with_error(e, palette);
+                cached.code = None;
+            }
         }
+        cached.fresh = true;
+        cached
     }
 
-    // (Would be nice to also support disassembling arbitrary memory, regardless of functions or binaries. E.g. for JIT-generated code.)
     fn disassemble_function(binary: &Binary, function_idx: usize, palette: &Palette) -> Result<Disassembly> {
         let symbols = binary.symbols.as_ref().unwrap();
         let ranges = symbols.function_addr_ranges(function_idx);
@@ -2337,25 +2426,43 @@ impl DisassemblyWindow {
     }
 
     fn evict_cache(&mut self) {
-        if self.cache.len().saturating_sub(self.tabs.len()) > 100 {
+        let function_count = self.cache.keys().filter(|k| matches!(k, DisassemblyCacheKey::Function(..))).count();
+        let function_tabs = self.tabs.iter().filter(|t| t.locator.is_some()).count();
+        if function_count.saturating_sub(function_tabs) > 100 {
             let mut in_use: HashSet<DisassemblyCacheKey> = HashSet::new();
             for t in &self.tabs {
                 if let Some(x) = t.cached_function_idx.clone() {
                     in_use.insert(DisassemblyCacheKey::Function(x.0, x.1));
                 }
-                if let Some(r) = &t.memory_range {
-                    in_use.insert(DisassemblyCacheKey::Memory(r.start, r.end, t.requested_addr));
-                }
             }
             let mut i = 0;
             self.cache.retain(|k, _| {
-                if in_use.contains(k) {
+                if matches!(k, DisassemblyCacheKey::Memory(..)) || in_use.contains(k) {
                     true
                 } else {
                     i += 1;
                     i % 2 == 0
                 }
             });
+        }
+
+        // Pinned tabs retain their locations, not necessarily their decoded listings.
+        // Keep the visible listing even if it alone exceeds the budget, to avoid
+        // decoding it again on every redraw.
+        const MEMORY_CACHE_BYTES: usize = 64 * 1024 * 1024;
+        let mut bytes: usize = self.cache.iter().filter(|(k, _)| matches!(k, DisassemblyCacheKey::Memory(..))).map(|(_, c)| c.memory_usage()).sum();
+        if bytes > MEMORY_CACHE_BYTES {
+            let selected = self.tabs.get(self.tabs_state.selected).and_then(|t| t.memory_range.as_ref().map(|r| DisassemblyCacheKey::Memory(r.start, r.end, t.requested_addr)));
+            let mut candidates: Vec<_> = self.cache.iter().filter(|(k, _)| matches!(k, DisassemblyCacheKey::Memory(..)) && Some(*k) != selected.as_ref())
+                .map(|(k, c)| (c.last_used, k.clone(), c.memory_usage())).collect();
+            candidates.sort_unstable_by_key(|c| c.0);
+            for (_, key, size) in candidates {
+                if bytes <= MEMORY_CACHE_BYTES {
+                    break;
+                }
+                self.cache.remove(&key);
+                bytes -= size;
+            }
         }
     }
 
@@ -2467,19 +2574,40 @@ impl DisassemblyWindow {
 
         if let Some(range) = tab.memory_range.clone() {
             let requested_addr = tab.requested_addr;
-            let disas = Self::find_or_disassemble_memory(&mut self.cache, debugger, range, requested_addr, &ui.palette);
+            let code = tab.memory_code.take();
+            let cached = Self::find_or_disassemble_memory(&mut self.cache, debugger, range.clone(), code, requested_addr, &ui.palette, ui.frame_idx);
+            let disas = &cached.disas;
+            let actual_end = cached.code.as_ref().map_or(range.end, |c| range.start + c.len());
+            ui_writeln!(ui, default_dim, "memory range: 0x{:x}-0x{:x}", range.start, actual_end);
+            ui_writeln!(ui, default_dim, "requested address: 0x{:x}", requested_addr);
+            if let Some(map) = debugger.info.maps.addr_to_map(range.start) {
+                ui_writeln!(ui, default_dim, "mapping: 0x{:x}-0x{:x} {}{}{} {}", map.start, map.start + map.len,
+                    if map.perms.contains(MemMapPermissions::READ) {"r"} else {"-"},
+                    if map.perms.contains(MemMapPermissions::WRITE) {"w"} else {"-"},
+                    if map.perms.contains(MemMapPermissions::EXECUTE) {"x"} else {"-"}, map.path.as_deref().unwrap_or("[anonymous]"));
+            }
+            ui.text.close_line();
             let tab = self.tabs.get_mut(self.tabs_state.selected).unwrap();
 
+            let pending_scroll = tab.memory_scroll.take();
+            let automatic_scroll = scroll_to.is_some() || pending_scroll.is_some();
             if let Some(DisassemblyScrollTarget::Memory {addr}) = scroll_to {
-                let line = disas.static_pseudo_addr_to_line(addr).0;
+                let line = disas.static_pseudo_addr_to_line(addr.max(range.start)).0;
                 tab.selected_subfunction_level = 0;
                 tab.area_state.select(line);
+            } else if let Some(addr) = pending_scroll {
+                let line = disas.static_pseudo_addr_to_line(addr.max(range.start)).0;
+                tab.area_state.scroll += line as isize - tab.area_state.cursor as isize;
+                tab.area_state.cursor = line;
             }
 
             let rel_addr_digits = (((disas.max_abs_relative_addr as f64 + 1.0).log2() / 4.0).ceil() as usize).max(1);
-            let prefix_width = 2 + 2 + 12+1 + rel_addr_digits+4 + 2 + 1;
+            let addr_digits = format!("{:x}", range.end.saturating_sub(1)).len().max(12);
+            let prefix_width = 2 + 2 + addr_digits+1 + rel_addr_digits+4 + 2 + 1;
 
             let end = ui.text.num_lines();
+            let previous_cursor = tab.area_state.cursor;
+            let previous_scroll = tab.area_state.scroll;
             let (content, visible_y) = with_parent!(ui, content_root, {
                 build_biscrollable_area_with_header(None, start..end, [prefix_width + disas.widest_line, disas.lines.len()], &mut tab.area_state, ui)
             });
@@ -2577,7 +2705,7 @@ impl DisassemblyWindow {
                         styled_write!(ui.text, style, "{}", marker);
 
                         let addr_style = if line.is_statement {ui.palette.disas_address_statement} else {ui.palette.disas_address_not_statement};
-                        styled_write!(ui.text, addr_style, "{:012x} ", addr);
+                        styled_write!(ui.text, addr_style, "{:0width$x} ", addr, width = addr_digits);
                         ui_write!(ui, disas_relative_address, "<{: >+1$x}> ", line.relative_addr, rel_addr_digits + 1);
                         ui_write!(ui, disas_jump_arrow, " {} ", line.jump_indicator);
 
@@ -2597,6 +2725,19 @@ impl DisassemblyWindow {
                     ui.add(w);
                 }
             });
+            // Grow only in response to navigation, not every redraw at a mapping edge.
+            if !automatic_scroll && (tab.area_state.cursor != previous_cursor || tab.area_state.scroll != previous_scroll) && disas.error.is_none() {
+                let cursor_addr = disas.lines.get(tab.area_state.cursor).map(|l| l.static_addr).filter(|a| *a != 0 && *a != usize::MAX).unwrap_or(range.start);
+                let backwards = (tab.area_state.cursor < previous_cursor && tab.area_state.cursor == 0 || tab.area_state.scroll < previous_scroll && tab.area_state.scroll == 0) && range.start > 0;
+                let forwards = tab.area_state.cursor > previous_cursor && tab.area_state.cursor.saturating_add(16) >= disas.lines.len() ||
+                    tab.area_state.scroll > previous_scroll && visible_y.end.saturating_add(16) >= disas.lines.len() as isize;
+                if backwards || forwards {
+                    if self.extend_memory_tab(self.tabs_state.selected, backwards, forwards, debugger, &ui.palette, ui.frame_idx) {
+                        self.tabs[self.tabs_state.selected].memory_scroll = Some(cursor_addr);
+                        ui.should_redraw = true;
+                    }
+                }
+            }
             return;
         }
 
@@ -2883,6 +3024,22 @@ impl DisassemblyWindow {
 
 impl WindowContent for DisassemblyWindow {
     fn build(&mut self, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
+        // Function bytes come from ELF files; memory bytes may change whenever the
+        // debuggee runs, even if no mappings or symbols changed.
+        let memory_stop = debugger.threads.get(&state.selected_thread).map(|t| (debugger.start_count, state.selected_thread, t.stop_count));
+        if memory_stop != self.memory_stop {
+            self.memory_stop = memory_stop;
+            for (key, cached) in &mut self.cache {
+                if matches!(key, DisassemblyCacheKey::Memory(..)) {
+                    cached.fresh = false;
+                }
+            }
+            self.failed_memory_ranges.clear();
+            for tab in &mut self.tabs {
+                tab.memory_code = None;
+                tab.memory_scroll = None;
+            }
+        }
         // First do things that may open or close tabs.
 
         let mut open_dialog = false;
@@ -2980,7 +3137,6 @@ impl WindowContent for DisassemblyWindow {
         }
 
         close_excess_ephemeral_tabs(&mut self.tabs, &mut self.tabs_state, |t| t.ephemeral);
-        self.evict_cache();
 
         // Now the set of tabs is final.
 
@@ -3013,6 +3169,7 @@ impl WindowContent for DisassemblyWindow {
         });
 
         self.build_tab_content(content_root, scroll_to, suppress_code_autoscroll, state, debugger, ui);
+        self.evict_cache();
         
         if self.handle_tabs_action(tabs_action) {
             ui.should_redraw = true;
@@ -3086,6 +3243,8 @@ impl WindowContent for DisassemblyWindow {
         self.cache.clear();
         self.failed_memory_ranges.clear();
         for tab in &mut self.tabs {
+            tab.memory_code = None;
+            tab.memory_scroll = None;
             if tab.locator.is_some() {
                 tab.error = None;
                 tab.cached_function_idx = None;
@@ -4163,7 +4322,7 @@ impl WindowContent for StackWindow {
                 state.should_scroll_disassembly = Some((match (&frame.binary_id, &state.stack.subframes[frame.subframes.end - 1].function_idx) {
                     (Err(e), _) if e.is_loading() => Err(e.clone()),
                     (_, Err(e)) if e.is_loading() => Err(e.clone()),
-                    (_, Err(_)) | (Err(_), _) => Ok(DisassemblyOpenRequest::AutoMemory {ip: frame.pseudo_addr, cascade: false}),
+                    (_, Err(_)) | (Err(_), _) => Ok(DisassemblyOpenRequest::AutoMemory {ip: if state.selected_frame == 0 {frame.pseudo_addr} else {frame.addr}, addr: frame.pseudo_addr, cascade: false}),
                     (&Ok(binary_id), &Ok(function_idx)) => Ok(DisassemblyOpenRequest::Function {
                         binary_id, function_idx, static_pseudo_addr: frame.pseudo_addr.wrapping_sub(frame.addr_static_to_dynamic),
                         subfunction_level: (frame.subframes.end - state.selected_subframe - 1) as u16, cascade: false}),
@@ -5386,6 +5545,9 @@ impl WindowContent for BreakpointsWindow {
                         state.should_scroll_source = Some((Some(SourceScrollTarget {path: on.path.clone(), version: None, line: on.line, cascade: true}), false));
                     }
                     BreakpointOn::Instruction(on) => {
+                        if on.function.is_none() {
+                            state.should_scroll_disassembly = Some((DisassemblyWindow::find_manual_memory_target(on.addr, debugger, Some(on.addr)), false));
+                        }
                         if let Some((locator, offset)) = &on.function {
                             if let Ok(binary) = Debugger::find_binary_fuzzy(&debugger.symbols, &locator.binary_locator) {
                                 if let Ok(symbols) = &binary.symbols {

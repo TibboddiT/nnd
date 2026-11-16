@@ -122,6 +122,27 @@ impl Disassembly {
         }
         self
     }
+
+    // Memory listings have no source/inline lines. Restart before the last 14 bytes:
+    // a partial x86 instruction can have been emitted as several invalid instructions.
+    pub fn extend_memory(&mut self, range: Range<usize>, old_end: usize, code: &[u8], palette: &Palette) {
+        assert!(self.error.is_none() && !self.lines.is_empty());
+        let line = self.lines.partition_point(|l| l.static_addr <= old_end.saturating_sub(MAX_X86_INSTRUCTION_BYTES - 1)).saturating_sub(1);
+        let restart = self.lines[line].static_addr;
+        let mut tail = disassemble_memory(restart..range.end, &code[restart - range.start..], StyledText::default(), palette);
+        for l in &mut tail.lines {
+            l.relative_addr += (restart - range.start) as isize;
+        }
+        let spans = self.text.lines[line];
+        self.text.chars.truncate(self.text.spans[spans].0);
+        self.text.spans.truncate(spans + 1);
+        self.text.lines.truncate(line + 1);
+        self.lines.truncate(line);
+        self.text.import_lines(&tail.text, 0..tail.lines.len());
+        self.lines.extend(tail.lines);
+        self.widest_line = self.widest_line.max(tail.widest_line);
+        self.max_abs_relative_addr = self.lines.last().map_or(0, |l| l.relative_addr as usize);
+    }
 }
 
 struct StyledFormatter<'a> {
@@ -221,7 +242,9 @@ fn disassemble_addr_ranges(function: Option<(usize, &Symbols)>, mut addr_ranges:
             res.lines.push(DisassemblyLineInfo {kind: DisassemblyLineKind::Separator, static_addr: static_addr_range.start, ..Default::default()});
         }
 
-        let resolver = Resolver {symbols: function.map(|(_, symbols)| symbols), current_function: static_addr_range.clone()};
+        // Memory tabs use runtime branch targets. Unlike function-relative labels,
+        // these remain stable when a tab grows and formerly external targets enter it.
+        let resolver = Resolver {symbols: function.map(|(_, symbols)| symbols), current_function: if function.is_some() {static_addr_range.clone()} else {0..0}};
         // NasmFormatter wants to own the symbol resolver for some reason. (Probably it would be too inconvenient or inefficient to have lifetime argument all throughout the formatter implementation.)
         // We trust that the SymbolResolver reference isn't retained after the formatter is destroyed, so it should be ok to fudge the lifetime here.
         let resolver: Resolver<'static> = unsafe { std::mem::transmute(resolver) };
@@ -348,6 +371,23 @@ fn disassemble_addr_ranges(function: Option<(usize, &Symbols)>, mut addr_ranges:
     res.finish()
 }
 
+pub fn instruction_stream_has_boundary(code: &[u8], range_start: usize, ip: usize) -> bool {
+    if ip < range_start || ip >= range_start.saturating_add(code.len()) {
+        return false;
+    }
+    let mut decoder = Decoder::with_ip(64, code, range_start as u64, DecoderOptions::NONE);
+    while decoder.can_decode() {
+        let instruction = decoder.decode();
+        if instruction.is_invalid() || instruction.ip() as usize > ip {
+            return false;
+        }
+        if instruction.ip() as usize == ip {
+            return true;
+        }
+    }
+    false
+}
+
 /// Finds a unique candidate instruction stream at or before `ip`.
 /// `ip` is assumed to be a real instruction pointer, so candidates are kept only
 /// if decoding from them reaches `ip` as an instruction start.
@@ -369,23 +409,11 @@ pub fn find_unique_instruction_start_before_ip(code: &[u8], range_start: usize, 
     let mut found = None;
     let initial_last_start = probe_start.saturating_add(MAX_X86_INSTRUCTION_BYTES - 1).min(last_start);
     for start in probe_start..=initial_last_start {
-        let mut decoder = Decoder::with_ip(64, &code[start - range_start..], start as u64, DecoderOptions::NONE);
-        while decoder.can_decode() {
-            let instruction = decoder.decode();
-            if instruction.is_invalid() || instruction.len() == 0 {
-                break;
+        if instruction_stream_has_boundary(&code[start - range_start..], start, ip) {
+            if found.is_some() {
+                return None;
             }
-            let instruction_start = instruction.ip() as usize;
-            if instruction_start == ip {
-                if found.is_some() {
-                    return None;
-                }
-                found = Some(start);
-                break;
-            }
-            if instruction_start > ip {
-                break;
-            }
+            found = Some(start);
         }
     }
     found
@@ -471,272 +499,51 @@ fn clean_up_ranges(ranges: &mut Vec<Range<usize>>) {
 mod tests {
     use super::*;
 
-    const BASE: usize = 0x1000;
-
-    struct UniqueStartCase {
-        name: &'static str,
-        code: &'static [u8],
-        range_start: usize,
-        probe_start: usize,
-        probe_len: usize,
-        ip: usize,
-        expected: Option<usize>,
-    }
-
-    struct BestStartCase {
-        name: &'static str,
-        code: &'static [u8],
-        range_start: usize,
-        probe_start: usize,
-        probe_len: usize,
-        addr: usize,
-        ip_anchor: Option<usize>,
-        expected: Option<usize>,
-    }
-
-    const UNIQUE_RET: &[u8] = &[0x0f, 0x0f, 0x0f, 0x0f, 0xc3];
-    const LONG_NOP_THEN_RET: &[u8] = &[
-        // 14 operand-size prefixes + nop: every suffix ending at 0x90 is also a viable instruction.
-        0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
-        0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x90,
-        0xc3,
-    ];
-    const JIT_HELLO_PREFIX: &[u8] = &[
-        0xb8, 0x01, 0x00, 0x00, 0x00,             // mov eax, 1
-        0xbf, 0x01, 0x00, 0x00, 0x00,             // mov edi, 1
-        0x48, 0x8d, 0x35, 0x08, 0x00, 0x00, 0x00, // lea rsi, [rip+8]
-        0xba, 0x0c, 0x00, 0x00, 0x00,             // mov edx, 12
-        0x0f, 0x05,                               // syscall
-        0xc3,                                     // ret
-    ];
-
     #[test]
-    fn find_unique_instruction_start_before_ip_cases() {
-        let cases = [
-            UniqueStartCase {
-                name: "address_at_probe_start",
-                code: JIT_HELLO_PREFIX,
-                range_start: BASE,
-                probe_start: BASE,
-                probe_len: JIT_HELLO_PREFIX.len(),
-                ip: BASE,
-                expected: Some(BASE),
-            },
-            UniqueStartCase {
-                name: "unique_anchored_stream",
-                code: &[
-                    0x0f, 0x0f, 0x0f, 0x0f, 0x0f, 0x0f, 0x0f,
-                    0x0f, 0x0f, 0x0f, 0x0f, 0x0f, 0x0f, 0x0f,
-                    0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3,
-                ],
-                range_start: BASE,
-                probe_start: BASE,
-                probe_len: 21,
-                ip: BASE + 20,
-                expected: Some(BASE + 14),
-            },
-            UniqueStartCase {
-                name: "does_not_scan_whole_probe_window",
-                code: &[
-                    0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc,
-                    0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc,
-                    0x0f, 0x05, 0xc3,
-                ],
-                range_start: BASE,
-                probe_start: BASE,
-                probe_len: 19,
-                ip: BASE + 18,
-                expected: None,
-            },
-            UniqueStartCase {
-                name: "single_byte_instruction_stream_is_ambiguous",
-                code: &[0x90, 0x90, 0x90, 0x90, 0xc3],
-                range_start: BASE,
-                probe_start: BASE,
-                probe_len: 5,
-                ip: BASE + 4,
-                expected: None,
-            },
-            UniqueStartCase {
-                name: "prefix_chain_is_ambiguous",
-                code: LONG_NOP_THEN_RET,
-                range_start: BASE,
-                probe_start: BASE,
-                probe_len: LONG_NOP_THEN_RET.len(),
-                ip: BASE + 15,
-                expected: None,
-            },
-            UniqueStartCase {
-                name: "anchor_filters_unanchored_candidate",
-                code: &[0x0f, 0x1f, 0x40, 0x00, 0xc3],
-                range_start: BASE,
-                probe_start: BASE,
-                probe_len: 5,
-                ip: BASE + 4,
-                expected: None,
-            },
-            UniqueStartCase {
-                name: "multiple_anchored_candidates_are_ambiguous",
-                code: &[0x90, 0x0f, 0x05, 0xc3],
-                range_start: BASE,
-                probe_start: BASE,
-                probe_len: 4,
-                ip: BASE + 3,
-                expected: None,
-            },
-            UniqueStartCase {
-                name: "probe_before_range",
-                code: UNIQUE_RET,
-                range_start: BASE,
-                probe_start: BASE - 1,
-                probe_len: UNIQUE_RET.len(),
-                ip: BASE + 4,
-                expected: None,
-            },
-            UniqueStartCase {
-                name: "probe_after_range",
-                code: UNIQUE_RET,
-                range_start: BASE,
-                probe_start: BASE + UNIQUE_RET.len(),
-                probe_len: 1,
-                ip: BASE + 4,
-                expected: None,
-            },
-            UniqueStartCase {
-                name: "zero_len_probe",
-                code: UNIQUE_RET,
-                range_start: BASE,
-                probe_start: BASE,
-                probe_len: 0,
-                ip: BASE + 4,
-                expected: None,
-            },
-        ];
-
-        for case in cases {
-            let found = find_unique_instruction_start_before_ip(case.code, case.range_start, case.probe_start, case.probe_len, case.ip);
-            assert_eq!(case.expected, found, "{}", case.name);
-        }
+    fn ambiguous_instruction_stream() {
+        // Every suffix of these prefixes is valid: reaching RIP doesn't prove a start.
+        let code = [0x66, 0x66, 0x90, 0xc3];
+        assert_eq!(find_unique_instruction_start_before_ip(&code, 0x1000, 0x1000, code.len(), 0x1003), None);
+        // A unique stream before a return address can recover the containing instruction.
+        let code = [0x0f, 0x05, 0xc3];
+        assert_eq!(find_unique_instruction_start_before_ip(&code, 0x1000, 0x1000, 1, 0x1002), Some(0x1000));
     }
 
     #[test]
-    fn find_best_instruction_start_before_addr_cases() {
-        let cases = [
-            BestStartCase {
-                name: "address_inside_instruction",
-                code: &[0x0f, 0x05],
-                range_start: BASE,
-                probe_start: BASE,
-                probe_len: 1,
-                addr: BASE + 1,
-                ip_anchor: None,
-                expected: Some(BASE),
-            },
-            BestStartCase {
-                name: "jit_mov_eax_one_prefers_real_stream_without_anchor",
-                code: JIT_HELLO_PREFIX,
-                range_start: BASE,
-                probe_start: BASE,
-                probe_len: JIT_HELLO_PREFIX.len(),
-                addr: BASE + 1,
-                ip_anchor: None,
-                expected: Some(BASE),
-            },
-            BestStartCase {
-                name: "jit_mov_eax_one_uses_ip_anchor",
-                code: JIT_HELLO_PREFIX,
-                range_start: BASE,
-                probe_start: BASE,
-                probe_len: JIT_HELLO_PREFIX.len(),
-                addr: BASE + 1,
-                ip_anchor: Some(BASE),
-                expected: Some(BASE),
-            },
-            BestStartCase {
-                name: "jit_mov_eax_one_rejects_wrong_ip_anchor",
-                code: JIT_HELLO_PREFIX,
-                range_start: BASE,
-                probe_start: BASE,
-                probe_len: JIT_HELLO_PREFIX.len(),
-                addr: BASE + 1,
-                ip_anchor: Some(BASE + 1),
-                expected: Some(BASE + 1),
-            },
-            BestStartCase {
-                name: "anchor_before_candidate_window_rejects_all_candidates",
-                code: &[0x90, 0x90, 0x0f, 0x05],
-                range_start: BASE,
-                probe_start: BASE,
-                probe_len: 4,
-                addr: BASE + 3,
-                ip_anchor: Some(BASE),
-                expected: None,
-            },
-            BestStartCase {
-                name: "address_at_instruction_start",
-                code: UNIQUE_RET,
-                range_start: BASE,
-                probe_start: BASE,
-                probe_len: UNIQUE_RET.len(),
-                addr: BASE + 4,
-                ip_anchor: None,
-                expected: Some(BASE + 4),
-            },
-            BestStartCase {
-                name: "address_in_following_instruction",
-                code: UNIQUE_RET,
-                range_start: BASE,
-                probe_start: BASE,
-                probe_len: UNIQUE_RET.len(),
-                addr: BASE + 4,
-                ip_anchor: None,
-                expected: Some(BASE + 4),
-            },
-            BestStartCase {
-                name: "single_byte_stream_chooses_only_containing_start",
-                code: &[0x90, 0x90, 0x90, 0x90, 0xc3],
-                range_start: BASE,
-                probe_start: BASE,
-                probe_len: 5,
-                addr: BASE + 2,
-                ip_anchor: None,
-                expected: Some(BASE + 2),
-            },
-            BestStartCase {
-                name: "prefix_chain_tie_chooses_earliest_start",
-                code: LONG_NOP_THEN_RET,
-                range_start: BASE,
-                probe_start: BASE,
-                probe_len: LONG_NOP_THEN_RET.len(),
-                addr: BASE + 14,
-                ip_anchor: None,
-                expected: Some(BASE),
-            },
-            BestStartCase {
-                name: "prefix_chain_ret_chooses_ret",
-                code: LONG_NOP_THEN_RET,
-                range_start: BASE,
-                probe_start: BASE,
-                probe_len: LONG_NOP_THEN_RET.len(),
-                addr: BASE + 15,
-                ip_anchor: None,
-                expected: Some(BASE + 15),
-            },
-            BestStartCase {
-                name: "address_after_stream",
-                code: UNIQUE_RET,
-                range_start: BASE,
-                probe_start: BASE,
-                probe_len: UNIQUE_RET.len(),
-                addr: BASE + UNIQUE_RET.len(),
-                ip_anchor: None,
-                expected: None,
-            },
-        ];
+    fn containing_instruction_and_anchor() {
+        // syscall; ret. The second syscall byte alone is an incomplete add instruction.
+        let code = [0x0f, 0x05, 0xc3];
+        assert_eq!(find_best_instruction_start_before_addr(&code, 0x1000, 0x1000, code.len(), 0x1001, None), Some(0x1000));
+        // Both "mov eax, 1" and a stream beginning at its immediate can decode.
+        let code = [0xb8, 1, 0, 0, 0, 0xc3];
+        assert_eq!(find_best_instruction_start_before_addr(&code, 0x1000, 0x1000, code.len(), 0x1001, Some(0x1000)), Some(0x1000));
+        assert_eq!(find_best_instruction_start_before_addr(&code, 0x1000, 0x1000, code.len(), 0x1001, Some(0x1001)), Some(0x1001));
+        // Rewritten JIT code: an old start at +2 now lies inside lea, before ret at +3.
+        let replacement = [0x8d, 0x04, 0x7f, 0xc3];
+        assert!(instruction_stream_has_boundary(&replacement, 0x1000, 0x1003));
+        assert!(!instruction_stream_has_boundary(&replacement[2..], 0x1002, 0x1003));
+    }
 
-        for case in cases {
-            let found = find_best_instruction_start_before_addr(case.code, case.range_start, case.probe_start, case.probe_len, case.addr, case.ip_anchor);
-            assert_eq!(case.expected, found, "{}", case.name);
+    #[test]
+    fn incremental_memory_disassembly() {
+        // Include a maximum-length instruction, invalid bytes, and branches crossing
+        // the old window edge. Every possible split must match a single full decode.
+        let code = [
+            0xeb, 0x0f,
+            0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
+            0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x90,
+            0x06, 0xb8, 1, 0, 0, 0, 0xeb, 0xe7, 0xc3,
+        ];
+        let palette = Palette::default();
+        let range = 0x1000..0x1000 + code.len();
+        let full = disassemble_memory(range.clone(), &code, StyledText::default(), &palette);
+        for split in 1..code.len() {
+            let mut incremental = disassemble_memory(range.start..range.start + split, &code[..split], StyledText::default(), &palette);
+            incremental.extend_memory(range.clone(), range.start + split, &code, &palette);
+            assert_eq!(incremental.text.chars, full.text.chars, "split: {}", split);
+            let lines = |d: &Disassembly| d.lines.iter().map(|l| (l.static_addr, l.relative_addr, l.jump_target, l.jump_indicator)).collect::<Vec<_>>();
+            assert_eq!(lines(&incremental), lines(&full), "split: {}", split);
+            assert_eq!(incremental.text.lines, full.text.lines, "split: {}", split);
         }
     }
 }

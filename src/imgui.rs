@@ -25,7 +25,7 @@ impl AutoSize {
 }
 
 bitflags! {
-#[derive(Default)]
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AxisFlags: u32 {
     // Children will be positioned one after another, like a stack of boxes (unrelated to stack data structure). Otherwise they'll all be at the same position.
     const STACK = 0x1;
@@ -85,7 +85,7 @@ impl Axis {
 }
 
 bitflags! {
-#[derive(Default)]
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct WidgetFlags: u32 {
     // By default, if text doesn't fit horizontally or vertically in its Widget's width, a "…" is shown at the end. This flag disables this behavior.
     const TEXT_TRUNCATION_INDICATOR_DISABLE = 0x1;
@@ -144,7 +144,7 @@ pub struct WidgetFlags: u32 {
 }}
 
 bitflags! {
-#[derive(Default)]
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MouseActions : u16 {
     // Mouse click inside this Widget's rectangle, if not captured by any descendant Widget (e.g. button inside table row) and not obstructed by a later clickable Widget with overlapping rectangle (e.g. dialog box).
     const CLICK = 0x2;

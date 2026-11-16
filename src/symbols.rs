@@ -238,7 +238,7 @@ impl Subfunction {
     pub fn pack_range(r: Range<usize>) -> usize { r.start << 24 | r.len() }
 }
 
-bitflags! { pub struct FunctionFlags: u8 {
+bitflags! { #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)] pub struct FunctionFlags: u8 {
     // This is not a function but a marker telling where the previous function ends.
     const SENTINEL = 0x1;
     // Not a real function but address range of a misc code section, e.g. .plt
@@ -384,7 +384,7 @@ impl PackedVariableLocation {
     }
 }
 
-bitflags! { pub struct VariableFlags: u8 {
+bitflags! { #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)] pub struct VariableFlags: u8 {
     // It's an argument of the containing function.
     const PARAMETER = 0x1;
     // It's a pseudovariable holding the expression from DW_AT_frame_base.
@@ -510,7 +510,7 @@ impl FileVersionInfo {
 
 pub const SUBFUNCTION_LEVEL_MAX: u16 = (1 << 12) - 1; // keep in sync with LineInfo
 
-bitflags! { pub struct LineFlags: usize {
+bitflags! { #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)] pub struct LineFlags: usize {
     // In addr_to_line: end of inlined function.
     // In line_to_addr: start of inlined function.
     const INLINED_FUNCTION = 0x1;
@@ -1595,16 +1595,12 @@ impl SymbolsLoader {
                             Err(e) => if shard.warn.check(line!()) { eprintln!("warning: failed to demangle (1) vtable symtab entry '{}': {}", String::from_utf8_lossy(mangled), e); }
                             Ok(symbol) => match symbol.demangle_with_options(&cpp_demangle::DemangleOptions::default().recursion_limit(1000)) {
                                 Err(e) => if shard.warn.check(line!()) { eprintln!("warning: failed to demangle (2) vtable symtab entry '{}': {}", String::from_utf8_lossy(mangled), e); }
-                                Ok(name) if name.starts_with("{vtable(") => {
-                                    // It's either "{vtable(Foo)}" or "{vtable(Foo)} [.clone .3e570ba5df68adedf72ec05448f83d40]". AFAIU, the latter means it's a synthetic type that's not quite Foo; I guess we should still treat it as Foo.
-                                    let name = &name["{vtable(".len()..];
-                                    if let Some(end) = name.rfind(")}") {
-                                        let name = &name[..end];
-                                        let name = shard.sym.misc_arena.add_str(name);
-                                        shard.vtables.push(VTableInfo {start: addr, end: addr + sym.st_size as usize, name, type_: None});
-                                    } else {
-                                        if shard.warn.check(line!()) { eprintln!("error: unexpected demangled vtable name format, this is a bug: '{}' -> {}", String::from_utf8_lossy(mangled), name); }
-                                    }
+                                Ok(name) if name.starts_with("vtable for ") => {
+                                    // A clone suffix denotes a synthetic type that's not quite Foo; still treat it as Foo.
+                                    let name = &name["vtable for ".len()..];
+                                    let name = name.split(" [clone").next().unwrap();
+                                    let name = shard.sym.misc_arena.add_str(name);
+                                    shard.vtables.push(VTableInfo {start: addr, end: addr + sym.st_size as usize, name, type_: None});
                                 }
                                 Ok(name) => if shard.warn.check(line!()) { eprintln!("error: unexpected demangled vtable name format, this is a bug: '{}' -> {}", String::from_utf8_lossy(mangled), name); }
                             }
@@ -2003,7 +1999,7 @@ impl<T: Default, const FLAG: u16> FastStack<T, FLAG> {
     fn top2_mut(&mut self) -> &mut T { &mut self.s[self.len - 2] }
 }
 
-bitflags! { struct StackFlags: u16 {
+bitflags! { #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)] struct StackFlags: u16 {
     // Which other stacks to pop when popping entry from the main stack.
     const HAS_SCOPE = 0x1;
     const HAS_FUNCTION = 0x2;
@@ -2417,7 +2413,7 @@ impl<'a> DwarfLoader<'a> {
 
     fn load(&mut self) -> Result<()> {
         {
-            let start_offset = self.unit.unit.header.offset().as_debug_info_offset().unwrap();
+            let start_offset = self.unit.unit.header.debug_info_offset().unwrap();
             self.shard.types.set_unit(start_offset, DebugInfoOffset(start_offset.0 + self.unit.unit.header.length_including_self()));
         }
 

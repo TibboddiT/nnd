@@ -41,7 +41,7 @@ impl LanguageFamily {
     }
 }
 
-bitflags! { pub struct PrimitiveFlags: u8 {
+bitflags! { #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)] pub struct PrimitiveFlags: u8 {
     const SIGNED = 0x1;
     const FLOAT = 0x2;
     const CHAR = 0x4;
@@ -51,7 +51,7 @@ bitflags! { pub struct PrimitiveFlags: u8 {
     const UNSPECIFIED = 0x20; // DW_TAG_unspecified_type
 }}
 
-bitflags! { pub struct PointerFlags: u8 {
+bitflags! { #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)] pub struct PointerFlags: u8 {
     const REFERENCE = 0x1;
 }}
 
@@ -71,7 +71,7 @@ pub struct PointerToMemberType {
     pub containing_type: *const TypeInfo,
 }
 
-bitflags! { pub struct ArrayFlags: u8 {
+bitflags! { #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)] pub struct ArrayFlags: u8 {
     // Length is constant. For VLA, DWARF contains an expression to calculate actual length, but we don't support it.
     const LEN_KNOWN = 0x1;
     // We print array as string if its element type is 1-byte char, or if this flag is set. In both cases we assume UTF8.
@@ -90,7 +90,7 @@ pub struct ArrayType {
     pub len: usize,
 }
 
-bitflags! { pub struct SliceFlags: u8 {
+bitflags! { #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)] pub struct SliceFlags: u8 {
     const UTF_STRING = 0x2;
 }}
 
@@ -101,7 +101,7 @@ pub struct SliceType {
     pub type_: *const TypeInfo,
 }
 
-bitflags! { pub struct FieldFlags: u8 {
+bitflags! { #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)] pub struct FieldFlags: u8 {
     // If name lives in Types.misc_arena. Otherwise it lives in binary's mmap or static.
     // Only relevant during symbols loading, can be omitted for types created by watch expressions.
     const NAME_IN_ARENA = 0x1;
@@ -154,7 +154,7 @@ impl StructField {
     }
 }
 
-bitflags! { pub struct StructFlags: u8 {
+bitflags! { #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)] pub struct StructFlags: u8 {
     const UNION = 0x1;
 }}
 
@@ -172,7 +172,7 @@ impl StructType {
     pub fn set_fields(&mut self, fields: &'static [StructField]) { self.fields_ptr = fields.as_ptr(); self.fields_len = fields.len(); }
 }
 
-bitflags! { pub struct EnumerandFlags: u8 {
+bitflags! { #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)] pub struct EnumerandFlags: u8 {
     const NAME_IN_ARENA = 0x1;
 }}
 
@@ -249,7 +249,7 @@ impl Type {
     }
 }    
 
-bitflags! { pub struct TypeFlags: u8 {
+bitflags! { #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)] pub struct TypeFlags: u8 {
     // The symbols had type declaration but no definition.
     const DECLARATION = 0x1;
     // The type uses something we don't support, e.g. fixed-point primitive types. We'll treat it as a byte string, or something.

@@ -90,7 +90,7 @@ impl Color {
 // so we shouldn't rely on them in the debugger UI. They're present in the enum only for passing through
 // to the console window if the debuggee outputs these ANSI codes.
 bitflags! {
-#[derive(Default)]
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Modifier: u8 {
     // Avoid using this in a load-bearing way.
     // E.g. undim the fg color or alter bg color in addition to using the modifier.

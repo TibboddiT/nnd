@@ -1,7 +1,7 @@
 use crate::{*, error::{*, Result, Error}, log::*, util::*, types::LanguageFamily};
 use gimli::{*, constants::DwForm};
 use std::{str, borrow::Cow, fmt, sync::{Mutex, Arc}, collections::{HashSet, HashMap, hash_map::Entry}, mem, ptr, ops::Range, arch::x86_64::*};
-use rand::random;
+use rand::{random, random_range};
 use bitflags::bitflags;
 
 // DWARF parsing.
@@ -20,7 +20,7 @@ use bitflags::bitflags;
 pub type DieOffset = DebugInfoOffset<usize>;
 
 // Set of unsupported DWARF features that we've encountered in a file, so that we can show a warning about it.
-bitflags! { pub struct DwarfUnsupportedFeatures: usize {
+bitflags! { #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)] pub struct DwarfUnsupportedFeatures: usize {
     const TYPE_SIGNATURES = 0x1;
     const SUPPLEMENTARY_OBJECT_FILES = 0x2;
     const SKELETON_UNITS = 0x4;
@@ -1048,9 +1048,9 @@ pub fn list_units(dwarf: &mut Dwarf<DwarfSlice>, binary_name: &str, layouts: All
     {
         let _prof = ProfileScope::with_threshold(0.01, format!("preparing units ({})", binary_name));
         for (header, abbreviation_set) in unit_headers {
-            let offset = match header.offset() {
-                UnitSectionOffset::DebugInfoOffset(o) => o,
-                _ => return err!(Internal, "unit offset has unexpected type"),
+            let offset = match header.debug_info_offset() {
+                Some(o) => o,
+                None => return err!(Internal, "unit offset has unexpected type"),
             };
             let mut unit = DwarfUnit {
                 offset,
@@ -1530,7 +1530,7 @@ pub mod tests {
         for it in 0..10000 {
             let signed = random::<bool>();
             let bits = (random::<u8>() % 64 + 1) as usize;
-            let mut num = random::<usize>();
+            let mut num = random_range(0..=usize::MAX);
             if signed && bits < 64 && random::<bool>() {
                 num |= (usize::MAX) << bits;
             } else {
@@ -1575,8 +1575,8 @@ pub mod tests {
     pub fn strlen() {
         let mut data = [0u8; 1200];
         for it in 0..100 {
-            let n = random::<usize>() % 1000;
-            let start = random::<usize>() % 50;
+            let n = random_range(0..1000);
+            let start = random_range(0..50);
             for i in 0..data.len() {
                 data[i] = random::<u8>();
                 while i >= start && i < start + n && data[i] == 0 {
@@ -1584,7 +1584,7 @@ pub mod tests {
                 }
             }
             data[start + n] = 0;
-            let lim = random::<usize>() % 1000;
+            let lim = random_range(0..1000);
             let res = unsafe {strlen_padded(data[start..].as_ptr(), lim)};
 
             if lim <= n {

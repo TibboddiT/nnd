@@ -66,7 +66,7 @@ pub struct MemMapInfo {
     pub elf_seen: bool, // CoreDumpMemorySource was updated to point to the loaded binary, if needed
 }
 
-bitflags! { pub struct MemMapPermissions: u8 {
+bitflags! { #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)] pub struct MemMapPermissions: u8 {
         const READ = 0b00001;
         const WRITE = 0b00010;
         const EXECUTE = 0b00100;

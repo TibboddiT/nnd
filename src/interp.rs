@@ -1095,7 +1095,7 @@ enum AST {
     },
 }
 
-bitflags! { struct ASTNodeFlags: u8 {
+bitflags! { #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)] struct ASTNodeFlags: u8 {
     const HAS_PARENS = 0x1; // is this node directly wrapped in any number of parens
 }}
 

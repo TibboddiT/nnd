@@ -338,7 +338,7 @@ impl Terminal {
 
 
 bitflags! {
-#[derive(Default)]
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ModKeys: u8 {
     // The values match the encoding in the ANSI escape codes, do not change.
     // SHIFT doesn't always appear as modifier: for Key::Char, it's built into the `char`, e.g. 'E' is shift+e.

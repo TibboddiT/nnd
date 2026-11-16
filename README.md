@@ -41,10 +41,9 @@ chmod +x nnd
 # try `./nnd --help` to get started
 ```
 
-Or build from source:
+Or build from source with Rust 1.90 or newer:
 ```bash
-rustup toolchain install 1.89
-cargo +1.89.0 build --profile dbgo
+cargo build --profile dbgo
 # The executable is at target/dbgo/nnd
 ```
 

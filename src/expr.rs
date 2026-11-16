@@ -641,7 +641,7 @@ impl EvalContext<'_> {
     }
 }
 
-bitflags! { pub struct ValueFlags: u16 {
+bitflags! { #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)] pub struct ValueFlags: u16 {
     // Ignore pretty printers. Affects formatting, field access, dereferencing (for smart pointers), indexing (for containers).
     const RAW = 0x1;
     // Force prettified value where normally raw value would be used (e.g. typeof(x.#p)). Mutually exclusive with RAW.
@@ -1390,7 +1390,7 @@ pub fn eval_dwarf_expression(mut expression: Expression<DwarfSlice>, context: &m
                     }
                 };
                 let die = unit.entry(offset)?;
-                let attr = die.attr_value(DW_AT_location)?;
+                let attr = die.attr_value(DW_AT_location);
                 let slice = match attr {
                     // It seems weird to ignore missing attribute, but it's what the DWARF spec says:
                     // "If there is no such attribute, then there is no effect."
@@ -1435,6 +1435,8 @@ pub fn eval_dwarf_expression(mut expression: Expression<DwarfSlice>, context: &m
             // These are just alternative polite ways for the compiler to say "optimized out".
             EvaluationResult::RequiresEntryValue(_) => return err!(OptimizedAway, "requires entry value"),
             EvaluationResult::RequiresParameterRef(_) => return err!(OptimizedAway, "requires parameter ref"),
+            EvaluationResult::RequiresWasmLocal {..} | EvaluationResult::RequiresWasmGlobal {..} | EvaluationResult::RequiresWasmStack {..} =>
+                return err!(NotImplemented, "WebAssembly DWARF locations"),
         }?;
     }
     let pieces = eval.result();
@@ -1611,11 +1613,11 @@ mod tests {
     fn value_blob_nonsense() {
         let lens = [1, 3, 5, 7, 8, 9, 13, 15, 16, 17, 23, 24, 25, 25, 28, 31, 32, 33, 34, 35, 38, 39, 40, 41, 47];
         for _ in 0..3000 {
-            let bits1 = lens[random::<usize>()%lens.len()];
-            let bits2 = lens[random::<usize>()%lens.len()];
-            let pos1: usize = random::<usize>()%bits1;
-            let pos2: usize = random::<usize>()%bits2;
-            let off: usize = random::<usize>()%(pos2+1);
+            let bits1 = lens[rand::random_range(0..lens.len())];
+            let bits2 = lens[rand::random_range(0..lens.len())];
+            let pos1: usize = rand::random_range(0..bits1);
+            let pos2: usize = rand::random_range(0..bits2);
+            let off: usize = rand::random_range(0..=pos2);
 
             let mut a = ValueBlob::with_capacity((bits1+7)/8);
             let mut b = ValueBlob::with_capacity((bits2+7)/8);

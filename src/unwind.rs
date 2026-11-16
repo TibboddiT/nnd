@@ -174,7 +174,7 @@ fn find_cie_in(offset: u64, cies: &Vec<CommonInformationEntry<DwarfSlice>>) -> g
     if idx < cies.len() && cies[idx].offset() == offset as usize {
         Ok(cies[idx].clone())
     } else {
-        Err(gimli::read::Error::NoEntryAtGivenOffset)
+        Err(gimli::read::Error::NoEntryAtGivenOffset(offset))
     }
 }
 
@@ -612,7 +612,6 @@ fn eval_register_rule(reg: Option<RegisterIdx>, rule: &RegisterRule<usize>, enco
 
         RegisterRule::Constant(c) => (*c, false),
 
-        _ => return err!(Dwarf, "unsupported type of register rule: {:?}", rule),
     };
     Ok(Some(val))
 }

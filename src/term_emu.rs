@@ -1,5 +1,5 @@
 use crate::{*, error::*, terminal::*, util::*};
-use std::{collections::VecDeque, ffi::OsStr};
+use std::{collections::VecDeque, ffi::OsStr, num::NonZeroU16};
 
 pub struct Pty {
     pub master_fd: i32,
@@ -137,29 +137,31 @@ pub struct TerminalEmulator {
     pub size: [u16; 2], // [width, height]
     pub scrollback_limit: usize,
 }
-impl Default for TerminalEmulator { fn default() -> Self { Self {vt: vt100::Parser::new(1, 1, 0), size: [0, 0], scrollback_limit: 0} } }
+impl Default for TerminalEmulator { fn default() -> Self { Self {vt: vt100::Parser::new(NonZeroU16::MIN, NonZeroU16::MIN, 0), size: [0, 0], scrollback_limit: 0} } }
 impl TerminalEmulator {
     pub fn program_restarted(&mut self) {
         // We want to reset parser state and modes/colors/cursor/etc while preserving screen and scrollback contents.
         // vt100 library doesn't seem to have a reasonable way to do it, so we do weird things here that partially rely on vt100 internals and may partially break in future.
 
         // Create a new Parser to reset the parsing state (useful if the program crashed in the middle of outputting an ANSI escape sequence).
-        let mut new_vt = vt100::Parser::new(self.size[1], self.size[0], self.scrollback_limit);
+        let [cols, rows] = self.size.map(|s| NonZeroU16::new(s.max(1)).unwrap());
+        let mut new_vt = vt100::Parser::new(rows, cols, self.scrollback_limit);
 
         // Move the screen contents to the new Parser.
-        let dummy_vt = vt100::Parser::new(1, 1, 0);
+        let dummy_vt = vt100::Parser::new(NonZeroU16::MIN, NonZeroU16::MIN, 0);
         *new_vt.screen_mut() = mem::replace(self.vt.screen_mut(), dummy_vt.screen().clone());
 
         // Reset the Screen's state without changing contents.
         // We have to do it by sending ANSI commands because Screen has no public methods to alter state directly.
-        // From looking at vt100 source, as of version vt100-0.16.2, the commands below clear all needed fields of Screen except `saved_attrs`.
+        // As of vt100-0.18.1, the commands below reset attributes, cursor style/visibility, and input modes.
+        // saved_attrs and last_char are left as-is.
         // Some fields of Grid would in principle make sense to reset, but it's not important, so we leave them: saved_pos, scroll_top/scroll_bottom (that's ansi stuff, not our ui scrolling), saved_origin_mode.
         let screen = new_vt.screen_mut();
         let blank_screen = dummy_vt.screen();
         new_vt.process(b"\x1b[?47l\x1b[?6l"); // exit alternate screen, clear origin_mode
-        new_vt.process(&blank_screen.attributes_formatted());
-        new_vt.process(&blank_screen.cursor_state_formatted());
-        new_vt.process(&blank_screen.input_mode_formatted());
+        new_vt.process(blank_screen.attributes_formatted().as_bytes());
+        new_vt.process(blank_screen.cursor_state_formatted().as_bytes());
+        new_vt.process(blank_screen.input_mode_formatted().as_bytes());
         new_vt.screen_mut().set_scrollback(0);
 
         new_vt.process(b"\x1B[10000;0H\n"); // move cursor to the bottom of the screen (vt100 clamps the coordinates), then add a new row below that
@@ -170,14 +172,15 @@ impl TerminalEmulator {
     }
 
     pub fn set_size_and_scrollback(&mut self, size: [u16; 2], scrollback_limit: usize) {
+        let [cols, rows] = size.map(|s| NonZeroU16::new(s.max(1)).unwrap());
         if scrollback_limit != self.scrollback_limit {
             self.size = size;
             self.scrollback_limit = scrollback_limit;
-            self.vt = vt100::Parser::new(size[1], size[0], scrollback_limit);
+            self.vt = vt100::Parser::new(rows, cols, scrollback_limit);
         }
         if size != self.size {
             self.size = size;
-            self.vt.screen_mut().set_size(size[1], size[0]);
+            self.vt.screen_mut().set_size(rows, cols);
         }
     }
 

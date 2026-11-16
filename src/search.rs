@@ -1,7 +1,7 @@
 use crate::{*, symbols::*, arena::*, procfs::*, symbols_registry::*, util::*, context::*, executor::*, types::*};
 use std::{mem, path::PathBuf, sync::{Arc, Mutex, atomic::{AtomicBool, AtomicUsize, Ordering}}, collections::HashSet, cmp, ops::Range, os::unix::ffi::OsStrExt, path::Path, str};
 use std::arch::x86_64::*;
-use rand::{random, distributions::Alphanumeric, thread_rng, Rng};
+use rand::{random, random_range, distr::Alphanumeric, rng, RngExt};
 
 pub struct SymbolSearcher {
     pub searcher: Arc<dyn Searcher>,
@@ -770,15 +770,15 @@ mod tests {
 
     #[test]
     fn test_memmem() {
-        let mut rng = thread_rng();
+        let mut rng = rng();
         // Short enough that we'll hit empty substring case sometimes, long enough to have a few 32-byte blocks.
         let data: String = (0..300).map(|_| rng.sample(Alphanumeric) as char).collect();
         let mut temp = String::new();
         for i in 0..3000 {
-            let hay_start = random::<usize>() % (data.len() + 1);
-            let hay_len = random::<usize>() % (data.len() - hay_start + 1);
-            let needle_start = random::<usize>() % (data.len() + 1);
-            let needle_len = random::<usize>() % (data.len() - needle_start + 1).min(hay_len + 3);
+            let hay_start = random_range(0..=data.len());
+            let hay_len = random_range(0..=data.len() - hay_start);
+            let needle_start = random_range(0..=data.len());
+            let needle_len = random_range(0..(data.len() - needle_start + 1).min(hay_len + 3));
             let case_sensitive = random::<bool>();
             let hay = &data[hay_start..hay_start + hay_len];
             let needle = &data[needle_start..needle_start + needle_len];
@@ -792,7 +792,7 @@ mod tests {
             if i % 4 == 0 && needle_len != 0 {
                 let c = rng.sample(Alphanumeric) as u8;
                 bad_needle |= !case_sensitive && (c as char).is_ascii_uppercase();
-                unsafe {temp.as_bytes_mut()[random::<usize>() % needle_len] = c};
+                unsafe {temp.as_bytes_mut()[random_range(0..needle_len)] = c};
             }
             let needle = &temp;
 

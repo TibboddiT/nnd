@@ -1,7 +1,7 @@
 use crate::{*, debugger::*, error::*, log::*, symbols::*, symbols_registry::*, util::*, registers::*, procfs::*, unwind::*, disassembly::*, pool::*, layout::*, settings::*, context::*, types::*, expr::*, widgets::*, search::*, arena::*, interp::*, imgui::*, common_ui::*, terminal::*, doc::*, os::*, term_emu::*};
 use std::{io::{self, Write, BufRead, BufReader, Read}, mem::{self, take}, collections::{HashSet, HashMap, hash_map::Entry, VecDeque}, os::fd::AsRawFd, path, path::{Path, PathBuf}, fs::File, fmt::Write as FmtWrite, borrow::Cow, ops::Range, str, os::unix::ffi::OsStrExt, sync::{Arc}, time::Duration};
 use libc::{self, pid_t};
-use rand::random;
+use rand::random_range;
 
 pub struct DebuggerUI {
     pub terminal: Terminal,
@@ -755,10 +755,10 @@ impl Default for WatchesWindow {
     fn default() -> Self {
         let mut r = Self {tree: ValueTree::default(), expanded_nodes: HashSet::new(), cursor_path: Vec::new(), cursor_idx: 0, scroll: 0, scroll_to_cursor: false, name_relative_width: 0.4, name_width: 0, value_width: 0, row_height_limit: 0, indent_width: 0, max_indent: 0, seen: (0, usize::MAX, usize::MAX, ProcessState::NoProcess), have_good_cached_values: false, expressions: Vec::new(), text_input: None, text_input_built: false, eval_state: EvalState::new(), data_breakpoints: HashMap::new(), variable_search_dialog: None, type_search_dialog: None };
 
-        let locals_identity: usize = random();
+        let locals_identity: usize = random_range(0..=usize::MAX);
         r.expanded_nodes.insert(locals_identity);
         r.expressions.push(WatchExpression {identity: locals_identity, text: "[locals]".to_string(), special: Some(SpecialWatch::Locals)});
-        r.expressions.push(WatchExpression {identity: random(), text: "[registers]".to_string(), special: Some(SpecialWatch::Registers)});
+        r.expressions.push(WatchExpression {identity: random_range(0..=usize::MAX), text: "[registers]".to_string(), special: Some(SpecialWatch::Registers)});
         r
     }
 }
@@ -1319,7 +1319,7 @@ impl WatchesWindow {
         if self.expressions.last().is_some_and(|e| &e.special == &Some(SpecialWatch::AddWatch)) {
             i -= 1;
         }
-        let identity: usize = random();
+        let identity: usize = random_range(0..=usize::MAX);
         self.expressions.insert(i, WatchExpression {identity, text: s, special: None});
         self.cursor_path = vec![identity];
         *refresh_data = true;
@@ -1565,7 +1565,7 @@ impl WindowContent for WatchesWindow {
 
         // Add the "<add watch>" placeholder watch.
         if self.expressions.iter().position(|e| &e.special == &Some(SpecialWatch::AddWatch)).is_none() {
-            let identity: usize = random();
+            let identity: usize = random_range(0..=usize::MAX);
             self.expressions.push(WatchExpression {identity, text: "<add watch>".to_string(), special: Some(SpecialWatch::AddWatch)});
             self.cursor_path = vec![identity];
             refresh_data = true;
@@ -1767,7 +1767,7 @@ impl WindowContent for WatchesWindow {
         self.name_relative_width = inp.read_u32()? as f64 / 1e9;
         while inp.read_u8()? != 0 {
             let text = inp.read_str()?;
-            self.expressions.push(WatchExpression {identity: random(), text, special: None});
+            self.expressions.push(WatchExpression {identity: random_range(0..=usize::MAX), text, special: None});
         }
         Ok(())
     }
@@ -1943,7 +1943,7 @@ impl DisassemblyWindow {
             // Ignore requests to open a "symbols are loading" error tab, because such tab would remain after symbols are loaded, and it'd be confusing.
             Err(e) if e.is_loading() => return Ok(()),
             Err(e) => {
-                self.tabs.push(DisassemblyTab {identity: random(), error: Some(e), title: "[unknown]".to_string(), ephemeral: true, ..Default::default()});
+                self.tabs.push(DisassemblyTab {identity: random_range(0..=usize::MAX), error: Some(e), title: "[unknown]".to_string(), ephemeral: true, ..Default::default()});
                 self.tabs_state.select(self.tabs.len() - 1);
                 return Ok(());
             }
@@ -1987,7 +1987,7 @@ impl DisassemblyWindow {
                     }
                 }
                 self.tabs.push(DisassemblyTab {
-                    identity: random(), memory_range: Some(range.clone()), memory_code: code, requested_addr,
+                    identity: random_range(0..=usize::MAX), memory_range: Some(range.clone()), memory_code: code, requested_addr,
                     title: format!("mem:{:x}", requested_addr), ephemeral: true,
                     ..Default::default()
                 });
@@ -1996,7 +1996,7 @@ impl DisassemblyWindow {
             }
             DisassemblyOpenRequest::AutoMemory {ip, addr, ..} => {
                 if let Err(e) = self.open_auto_memory(ip, addr, debugger) {
-                    self.tabs.push(DisassemblyTab {identity: random(), error: Some(e), title: "[memory]".to_string(), ephemeral: true, ..Default::default()});
+                    self.tabs.push(DisassemblyTab {identity: random_range(0..=usize::MAX), error: Some(e), title: "[memory]".to_string(), ephemeral: true, ..Default::default()});
                     self.tabs_state.select(self.tabs.len() - 1);
                 }
                 return Ok(());
@@ -2021,7 +2021,7 @@ impl DisassemblyWindow {
         let demangled_name = function.demangle_name();
         let title = Self::make_title(&demangled_name);
         self.tabs.push(DisassemblyTab {
-            identity: random(), locator: Some(FunctionLocator {binary_locator: binary.locator.clone(), mangled_name: function.mangled_name().to_owned(), addr: function.addr, demangled_name}),
+            identity: random_range(0..=usize::MAX), locator: Some(FunctionLocator {binary_locator: binary.locator.clone(), mangled_name: function.mangled_name().to_owned(), addr: function.addr, demangled_name}),
             cached_function_idx: Some((target_binary_id, target_function_idx)), title, ephemeral: true, selected_subfunction_level: SUBFUNCTION_LEVEL_MAX, ..Default::default()});
         self.tabs_state.select(self.tabs.len() - 1);
 
@@ -3222,12 +3222,12 @@ impl WindowContent for DisassemblyWindow {
             if tag == 1 || tag == 2 {
                 let locator = FunctionLocator::load_state(inp)?;
                 let title = Self::make_title(&locator.demangled_name);
-                self.tabs.push(DisassemblyTab {identity: random(), title, locator: Some(locator), error: None, area_state: AreaState::load_state(inp)?, selected_subfunction_level: inp.read_u16()?, ephemeral: false, cached_function_idx: None, ..Default::default()});
+                self.tabs.push(DisassemblyTab {identity: random_range(0..=usize::MAX), title, locator: Some(locator), error: None, area_state: AreaState::load_state(inp)?, selected_subfunction_level: inp.read_u16()?, ephemeral: false, cached_function_idx: None, ..Default::default()});
             } else if tag == 3 || tag == 4 {
                 let start = inp.read_usize()?;
                 let end = inp.read_usize()?;
                 let requested_addr = inp.read_usize()?;
-                self.tabs.push(DisassemblyTab {identity: random(), title: format!("mem:{:x}", requested_addr), memory_range: Some(start..end), requested_addr, error: None, area_state: AreaState::load_state(inp)?, selected_subfunction_level: inp.read_u16()?, ephemeral: false, ..Default::default()});
+                self.tabs.push(DisassemblyTab {identity: random_range(0..=usize::MAX), title: format!("mem:{:x}", requested_addr), memory_range: Some(start..end), requested_addr, error: None, area_state: AreaState::load_state(inp)?, selected_subfunction_level: inp.read_u16()?, ephemeral: false, ..Default::default()});
             } else {
                 return err!(Format, "unknown disassembly tab tag: {}", tag);
             }
@@ -4703,7 +4703,7 @@ impl CodeWindow {
         }
         res.widest_line = res.text.widest_line(0..res.text.num_lines());
 
-        Ok((buffered.count, buffered.hasher.compute().into()))
+        Ok((buffered.count, buffered.hasher.finalize().into()))
     }
 
     fn make_title(path_in_symbols: &Path) -> String {
@@ -4738,7 +4738,7 @@ impl CodeWindow {
             return;
         }
         let title = Self::make_title(path_in_symbols);
-        self.tabs.push(CodeTab {identity: random(), title, path_in_symbols: path_in_symbols.to_owned(), version_in_symbols: version.clone(), area_state: AreaState::default(), ephemeral: true});
+        self.tabs.push(CodeTab {identity: random_range(0..=usize::MAX), title, path_in_symbols: path_in_symbols.to_owned(), version_in_symbols: version.clone(), area_state: AreaState::default(), ephemeral: true});
         self.tabs_state.select(self.tabs.len() - 1);
     }
 
@@ -5282,7 +5282,7 @@ impl WindowContent for CodeWindow {
             }
             let path_in_symbols = inp.read_path()?;
             let title = Self::make_title(&path_in_symbols);
-            self.tabs.push(CodeTab {identity: random(), title, path_in_symbols, version_in_symbols: None, area_state: AreaState::load_state(inp)?, ephemeral: false});
+            self.tabs.push(CodeTab {identity: random_range(0..=usize::MAX), title, path_in_symbols, version_in_symbols: None, area_state: AreaState::load_state(inp)?, ephemeral: false});
         }
         // Prevent auto-scrolling the disassembly window before any input is made.
         self.disassembly_scrolled_to = self.disassembly_scroll_key();

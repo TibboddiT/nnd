@@ -223,7 +223,7 @@ pub fn apply_to_text(text: &mut StyledText, path: &Path, palette: &Palette) {
     }
 
     let mut highlighter = Highlighter::new();
-    let events = match highlighter.highlight(config, buf.chars.as_bytes(), None, |name| {
+    let events = match highlighter.highlight(config, buf.chars.as_bytes(), None, None, |name| {
         config_for_injection(name)
     }) {
         Ok(events) => events,
